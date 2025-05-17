@@ -1,6 +1,6 @@
 torch>=2.7.0
 sentence-transformers>=2.6.0
-spacy>=3.8.4
+spacy>=3.8.4,<3.9
 pysubs2
 jieba
 regex
