@@ -1,4 +1,5 @@
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -25,9 +26,44 @@ def load_inputs(eng_path: Path, zh_path: Path):
     subs = pysubs2.load(str(eng_path))
     with zh_path.open("r", encoding="utf-8") as f:
         zh_lines = [line.strip() for line in f if line.strip()]
-    if abs(len(subs) - len(zh_lines)) / max(len(subs), 1) > 0.10:
-        raise ValueError("Line count difference between ENG and ZH exceeds 10%")
     return subs, zh_lines
+
+
+def merge_eng_cues(cues: List[str]) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """Merge cue texts into sentences based on punctuation."""
+    import regex as re
+    sentences: List[str] = []
+    mapping: List[Tuple[int, int]] = []
+    buf: List[str] = []
+    start = 0
+    pattern = re.compile(r"[.!?][\]\)\"]?$")
+    for idx, text in enumerate(cues):
+        if not buf:
+            start = idx
+        buf.append(text.strip())
+        if pattern.search(text.strip()):
+            sentences.append(" ".join(buf))
+            mapping.append((start, idx))
+            buf = []
+    if buf:
+        sentences.append(" ".join(buf))
+        mapping.append((start, len(cues) - 1))
+    return sentences, mapping
+
+
+def check_line_gap(n_eng: int, n_zh: int, allow_large: bool) -> None:
+    diff = abs(n_eng - n_zh) / max(n_eng, 1)
+    if diff > 0.20:
+        raise ValueError("Line count difference between ENG and ZH exceeds 20%")
+    if diff > 0.10 and not allow_large:
+        raise ValueError(
+            "Line count difference between ENG and ZH exceeds 10% (use --allow-large-gap to continue)"
+        )
+    if diff > 0.10 and allow_large:
+        print(
+            "Warning: line count difference between ENG and ZH exceeds 10%. Please manually inspect QC report.",
+            file=sys.stderr,
+        )
 
 
 def segment_texts(en_lines: List[str], zh_lines: List[str], device: str) -> Tuple[List[str], List[str]]:
@@ -91,6 +127,8 @@ def main(argv: List[str] | None = None) -> int:
     parser.add_argument("--cps-threshold", type=float, default=17, help="CPS flag threshold")
     parser.add_argument("--similarity-flag", type=float, default=0.60, help="similarity flag threshold")
     parser.add_argument("--device", default="auto", help="cuda, mps or cpu")
+    parser.add_argument("--skip-eng-merge", action="store_true", help="skip merging English cues")
+    parser.add_argument("--allow-large-gap", action="store_true", help="allow 10-20%% line count difference")
     args = parser.parse_args(argv)
 
     start = time.perf_counter()
@@ -106,8 +144,20 @@ def main(argv: List[str] | None = None) -> int:
         log("Loading inputs …", start)
         subs, zh_lines = load_inputs(eng_path, zh_path)
         en_lines = [cue.text.replace("\n", " ") for cue in subs]
+
+        if args.skip_eng_merge:
+            sentences = en_lines
+            cue_map = [(i, i) for i in range(len(en_lines))]
+        else:
+            log("Merging English cues …", start)
+            sentences, cue_map = merge_eng_cues(en_lines)
+            Path("assets/ENG.sent.txt").write_text("\n".join(sentences), encoding="utf-8")
+            Path("assets/ENG.sent.map.json").write_text(json.dumps(cue_map, ensure_ascii=False), encoding="utf-8")
+
+        check_line_gap(len(sentences), len(zh_lines), args.allow_large_gap)
+
         log("Segmenting text …", start)
-        seg_en, seg_zh = segment_texts(en_lines, zh_lines, args.device)
+        seg_en, seg_zh = segment_texts(sentences, zh_lines, args.device)
 
         if args.device == "auto":
             device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
@@ -130,20 +180,22 @@ def main(argv: List[str] | None = None) -> int:
 
         log("Generating outputs …", start)
         report_lines = []
-        for idx, cue in enumerate(subs):
-            zh_idx = mapping[idx]
+        for sent_idx, (start_i, end_i) in enumerate(cue_map):
+            zh_idx = mapping[sent_idx]
             zh_line = zh_lines[zh_idx] if zh_idx >= 0 else ""
-            duration = (cue.end - cue.start).total_seconds()
-            cps = len(zh_line) / duration if duration > 0 else 0
-            sim = sim_mat[idx, zh_idx] if zh_idx >= 0 else 0.0
-            flags = []
-            if cps > args.cps_threshold:
-                flags.append("CPS_HIGH")
-            if sim < args.similarity_flag:
-                flags.append("LOW_SIM")
-            flag_str = ",".join(flags) if flags else "-"
-            report_lines.append(f"{idx+1} | {cps:.2f} | {sim:.2f} | {flag_str}")
-            cue.text = f"{cue.text}\n{zh_line}"
+            sim = sim_mat[sent_idx, zh_idx] if zh_idx >= 0 else 0.0
+            for cue_idx in range(start_i, end_i + 1):
+                cue = subs[cue_idx]
+                duration = (cue.end - cue.start).total_seconds()
+                cps = len(zh_line) / duration if duration > 0 else 0
+                flags = []
+                if cps > args.cps_threshold:
+                    flags.append("CPS_HIGH")
+                if sim < args.similarity_flag:
+                    flags.append("LOW_SIM")
+                flag_str = ",".join(flags) if flags else "-"
+                report_lines.append(f"{cue_idx+1} | {cps:.2f} | {sim:.2f} | {flag_str}")
+                cue.text = f"{cue.text}\n{zh_line}"
         out_srt = out_dir / "bilingual.srt"
         subs.save(str(out_srt))
         out_qc = out_dir / "QC_report.txt"
