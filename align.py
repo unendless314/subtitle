@@ -200,6 +200,9 @@ def main(argv: List[str] | None = None) -> int:
 
         log("Generating outputs …", start)
         report_lines = []
+        low_sim_count = 0
+        sim_total = 0.0
+        cue_count = 0
         for sent_idx, (start_i, end_i) in enumerate(cue_map):
             zh_idx = mapping[sent_idx]
             zh_line = zh_lines[zh_idx] if zh_idx >= 0 else ""
@@ -214,12 +217,33 @@ def main(argv: List[str] | None = None) -> int:
                 if sim < args.similarity_flag:
                     flags.append("LOW_SIM")
                 flag_str = ",".join(flags) if flags else "-"
-                report_lines.append(f"{cue_idx+1} | {cps:.2f} | {sim:.2f} | {flag_str}")
+                report_lines.append(
+                    f"{cue_idx+1} | {cps:.2f} | {sim:.2f} | {flag_str}"
+                )
                 cue.text = f"{cue.text}\n{zh_line}"
+                sim_total += sim
+                cue_count += 1
+                if "LOW_SIM" in flags:
+                    low_sim_count += 1
+
+        avg_sim = sim_total / cue_count if cue_count > 0 else 0.0
+        low_sim_pct = (low_sim_count / cue_count * 100) if cue_count > 0 else 0.0
+
+        if avg_sim < 0.80 or low_sim_pct > 5.0:
+            print(
+                f"QC failed: average similarity {avg_sim:.2f}, LOW_SIM {low_sim_pct:.1f}%",
+                file=sys.stderr,
+            )
+            return 1
+
         out_srt = out_dir / "bilingual.srt"
         subs.save(str(out_srt))
         out_qc = out_dir / "QC_report.txt"
         out_qc.write_text("\n".join(report_lines), encoding="utf-8")
+        log(
+            f"QC passed: average similarity {avg_sim:.2f}, LOW_SIM {low_sim_pct:.1f}%",
+            start,
+        )
         log("Done", start)
         return 0
     except MemoryError:
