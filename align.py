@@ -160,11 +160,31 @@ def main(argv: List[str] | None = None) -> int:
         seg_en, seg_zh = segment_texts(sentences, zh_lines, args.device)
 
         if args.device == "auto":
-            device = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+            device = (
+                "cuda"
+                if torch.cuda.is_available()
+                else ("mps" if torch.backends.mps.is_available() else "cpu")
+            )
         else:
             device = args.device
         log(f"Using device: {device}", start)
-        model = SentenceTransformer("sentence-transformers/LaBSE", device=device)
+        try:
+            model = SentenceTransformer(
+                "sentence-transformers/LaBSE", device=device
+            )
+        except Exception as e:
+            if device == "mps":
+                print(
+                    f"Warning: failed to initialize MPS backend ({e}); falling back to CPU.",
+                    file=sys.stderr,
+                )
+                device = "cpu"
+                log(f"Using device: {device}", start)
+                model = SentenceTransformer(
+                    "sentence-transformers/LaBSE", device=device
+                )
+            else:
+                raise
 
         log("Embedding English …", start)
         emb_en = embed_texts(seg_en, model, args.chunk_size, start)
